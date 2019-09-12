@@ -20,15 +20,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/jaegertracing/jaeger/thrift-gen/jaeger"
+	"github.com/jaegertracing/jaeger/model"
 )
 
 func TestDirectProcessing(t *testing.T) {
 	assert := assert.New(t)
-	n := NewNonQueue(func(batch *jaeger.Batch) error {
+	n := NewNonQueue(func(batch model.Batch) error {
 		return fmt.Errorf("Error")
 	})
 
-	err := n.Enqueue(&jaeger.Batch{})
+	err := n.Enqueue(model.Batch{})
 	assert.Error(err, "Error")
 }
