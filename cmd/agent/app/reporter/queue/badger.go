@@ -1,22 +1,21 @@
 package queue
 
 import (
-	"bytes"
 	"encoding/binary"
 	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger"
 	"github.com/dgraph-io/badger/options"
-	b "github.com/go-swagger/go-swagger/fixtures/bugs/910"
-	"github.com/jaegertracing/jaeger/thrift-gen/jaeger"
+	"github.com/gogo/protobuf/proto"
+	"github.com/jaegertracing/jaeger/model"
 	"go.uber.org/zap"
 )
 
 const (
-	txIDSeqKey byte = 0x01
-	queueKey   byte = 0x10
-	lockSuffix byte = 0xFF
+	txIDSeqKey  byte = 0x01
+	queuePrefix byte = 0x10
+	lockPrefix  byte = 0xFF
 )
 
 // BadgerOptions includes all the parameters for the underlying badger instance
@@ -27,7 +26,7 @@ type BadgerOptions struct {
 }
 
 type consumerMessage struct {
-	batch *jaeger.Batch
+	batch model.Batch
 	txID  uint64
 }
 
@@ -37,7 +36,7 @@ type BadgerQueue struct {
 	store        *badger.DB
 	logger       *zap.Logger
 	txIDGen      *badger.Sequence
-	processor    func(*jaeger.Batch) error
+	processor    func(model.Batch) error
 	receiverChan chan consumerMessage
 	closeChan    chan struct{}
 	ackChan      chan uint64
@@ -45,7 +44,7 @@ type BadgerQueue struct {
 }
 
 // NewBadgerQueue returns
-func NewBadgerQueue(bopts *BadgerOptions, processor func(*jaeger.Batch) error, logger *zap.Logger) (*BadgerQueue, error) {
+func NewBadgerQueue(bopts *BadgerOptions, processor func(model.Batch) error, logger *zap.Logger) (*BadgerQueue, error) {
 	opts := badger.DefaultOptions
 	opts.TableLoadingMode = options.MemoryMap
 	opts.Dir = bopts.Directory
@@ -62,23 +61,27 @@ func NewBadgerQueue(bopts *BadgerOptions, processor func(*jaeger.Batch) error, l
 		return nil, err
 	}
 
-	// Remove all the lock keys here and calculate current size - the process has restarted
-	initialCount, err := b.initializeQueue()
-	if err != nil {
-		return nil, err
+	if bopts.Concurrency == 0 {
+		bopts.Concurrency = 1
 	}
 
 	b := &BadgerQueue{
-		queueCount:   initialCount,
 		logger:       logger,
 		store:        db,
 		txIDGen:      seq,
 		ackChan:      make(chan uint64, bopts.Concurrency),
 		receiverChan: make(chan consumerMessage, bopts.Concurrency),
 		closeChan:    make(chan struct{}),
-		notifyChan:   make(chan bool),
+		notifyChan:   make(chan bool, 1),
 		processor:    processor,
 	}
+
+	// Remove all the lock keys here and calculate current size - the process has restarted
+	initialCount, err := b.initializeQueue()
+	if err != nil {
+		return nil, err
+	}
+	b.queueCount = initialCount
 
 	if b.processor != nil {
 		// Start ack processing
@@ -121,32 +124,32 @@ func (b *BadgerQueue) batchProcessor() {
 }
 
 // Enqueue stores the batch to the Badger's storage
-func (b *BadgerQueue) Enqueue(batch *jaeger.Batch) error {
-	buf := new(bytes.Buffer)
+func (b *BadgerQueue) Enqueue(batch model.Batch) error {
 	txID, err := b.nextTransactionID()
 	if err != nil {
 		return err
 	}
-	binary.Write(buf, binary.BigEndian, queueKey)
-	binary.Write(buf, binary.BigEndian, txID)
-	key := buf.Bytes()
-	binary.Write(buf, binary.BigEndian, lockSuffix)
-	lockKey := buf.Bytes()
+
+	key := make([]byte, 9)
+	lockKey := make([]byte, 9)
+	key[0] = queuePrefix
+	lockKey[0] = lockPrefix
+	binary.BigEndian.PutUint64(key[1:], txID)
+	binary.BigEndian.PutUint64(lockKey[1:], txID)
 
 	bypassQueue := false
 
-	atomic.LoadInt32(&b.queueCount) < cap(b.receiverChan) {
-		bypassQueue = true
+	/*
+		if int(atomic.LoadInt32(&b.queueCount)) < cap(b.receiverChan) {
+			// Not really a too good algorithm..
+			bypassQueue = true
+		}
+	*/
+
+	bb, err := proto.Marshal(&batch)
+	if err != nil {
+		return err
 	}
-
-	// TODO Needs Thrift serializer and deserializer..
-
-	// var val []byte
-	// val, err = proto.Marshal(batch)
-
-	// if err != nil {
-	// 	return err
-	// }
 
 	err = b.store.Update(func(txn *badger.Txn) error {
 		if bypassQueue {
@@ -155,12 +158,11 @@ func (b *BadgerQueue) Enqueue(batch *jaeger.Batch) error {
 				return err
 			}
 		}
-		// TODO Add payload
-		return txn.Set(key, nil)
+		return txn.Set(key, bb)
 	})
 	atomic.AddInt32(&b.queueCount, int32(1))
 	if err == nil && bypassQueue {
-		// Push to channel since there's space - no point reading it from the badger
+		// Push to channel since there's space - no point passing it through badger
 		b.receiverChan <- consumerMessage{
 			txID:  txID,
 			batch: batch,
@@ -212,10 +214,15 @@ func parseItem(item *badger.Item) (consumerMessage, error) {
 		return consumerMessage{}, err
 	}
 
-	// TODO Deserialize the *batch.Jaeger
+	batch := model.Batch{}
+
+	if err := proto.Unmarshal(value, &batch); err != nil {
+		return consumerMessage{}, err
+	}
 
 	cm := consumerMessage{
-		txID: txID,
+		txID:  txID,
+		batch: batch,
 	}
 
 	return cm, nil
@@ -232,47 +239,39 @@ func (b *BadgerQueue) dequeueAvailableItems() error {
 			it := txn.NewIterator(opts)
 			defer it.Close()
 
-			prefix := []byte{queueKey}
-			lockKey := make([]byte, 10)
+			prefix := []byte{queuePrefix}
 
 			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 				item := it.Item()
-				lockKey = lockKey[:0]
+				lockKey := make([]byte, len(item.Key()))
 				copy(lockKey, item.Key())
-				lockKey[10] = lockSuffix
+				lockKey[0] = lockPrefix
 
-				it.Next()
-				if !it.Valid() {
-					// We're at the last item in the queue - but this one wasn't taken
+				if _, err := txn.Get(lockKey); err == badger.ErrKeyNotFound {
+					// No lockKey present, we can take this item
+					err2 := txn.Set(lockKey, nil)
+					if err2 != nil {
+						return err2
+					}
 					cm, err := parseItem(item)
 					if err != nil {
 						return err
 					}
 					fetchedItems = append(fetchedItems, cm)
-
-					txn.Set(lockKey, nil)
-					return nil
-				}
-
-				// There is next key, lets check it..
-				if bytes.Equal(item.Key(), lockKey) {
-					// This item is taken already - proceed to next one
-					continue
-				} else {
-					cm, err := parseItem(item)
-					if err != nil {
-						return err
+					if len(fetchedItems) == cap(fetchedItems) {
+						// Don't fetch more items at once
+						return nil
 					}
-					fetchedItems = append(fetchedItems, cm)
-
-					txn.Set(lockKey, nil)
-					return nil
 				}
 			}
 			return nil
 		})
 
 		if err != nil {
+			if err == badger.ErrConflict {
+				// Concurrent read/Write occurred, our transaction lost. Try again.
+				continue
+			}
 			return err
 		}
 
@@ -292,17 +291,19 @@ func (b *BadgerQueue) acker() {
 	for {
 		select {
 		case id := <-b.ackChan:
-			buf := new(bytes.Buffer)
-			binary.Write(buf, binary.BigEndian, queueKey)
-			binary.Write(buf, binary.BigEndian, id)
-			key := buf.Bytes()
-			binary.Write(buf, binary.BigEndian, byte(0xFF))
-			lockKey := buf.Bytes()
+			key := make([]byte, 9)
+			lockKey := make([]byte, 9)
+			key[0] = queuePrefix
+			lockKey[0] = lockPrefix
+			binary.BigEndian.PutUint64(key[1:], id)
+			binary.BigEndian.PutUint64(lockKey[1:], id)
+
 			err := b.store.Update(func(txn *badger.Txn) error {
 				txn.Delete(key)
 				txn.Delete(lockKey)
 				return nil
 			})
+
 			if err != nil {
 				b.logger.Error("Could not remove item from the queue", zap.Error(err))
 			}
@@ -322,8 +323,8 @@ func (b *BadgerQueue) Close() {
 	}
 }
 
-func (b *BadgerQueue) initializeQueue() (uint32, error) {
-	// Remove all keys, set the correct queue size
+func (b *BadgerQueue) initializeQueue() (int32, error) {
+	// Remove all lock keys, set the correct queue size
 	return 0, nil
 }
 

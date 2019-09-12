@@ -48,6 +48,9 @@ const (
 
 	// DIRECT is the reporter queue for testing (no queue at all)
 	DIRECT QueueType = "direct"
+
+	// BADGER is persisted reporter queue
+	BADGER QueueType = "badger"
 )
 
 // Type defines type of reporter.
@@ -69,7 +72,7 @@ type Options struct {
 // AddFlags adds flags for Options.
 func AddFlags(flags *flag.FlagSet) {
 	flags.String(prefix+reporterType, string(GRPC), fmt.Sprintf("Reporter type to use e.g. %s, %s", string(GRPC), string(TCHANNEL)))
-	flags.String(prefix+reporterQueueType, string(defaultQueueType), "queue implementation to use in the reporter. Available options: memory")
+	flags.String(prefix+reporterQueueType, string(defaultQueueType), "queue implementation to use in the reporter. Available options: memory, direct (no queue), badger")
 	flags.Int(prefix+boundedQueueSize, defaultBoundedQueueSize, "maximum size of bounded in-memory queue")
 	flags.Int(prefix+reporterQueueWorkers, defaultQueueWorkers, "the amount of concurrent reporter connections to use")
 	flags.Duration(prefix+reporterMaxInterval, defaultMaxRetryInterval, "longest period of time to wait before retry. Format is time.Duration (https://golang.org/pkg/time/#Duration).")
